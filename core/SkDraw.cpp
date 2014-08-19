@@ -32,6 +32,8 @@
 #include "SkDrawProcs.h"
 #include "SkMatrixUtils.h"
 
+#include "SkBlitMask.h"
+
 
 //#define TRACE_BITMAP_DRAWS
 
@@ -1503,6 +1505,27 @@ static void D1G_NoBounder_RectClip(const SkDraw1Glyph& state,
         bounds = &storage;
     }
 
+    mask.fRowBytes = glyph.rowBytes();
+    mask.fFormat = static_cast<SkMask::Format>(glyph.fMaskFormat);
+
+#ifdef SK_BUILD_FOR_WIN32
+    for (SkGlyph* i = glyph.fNextGlyph; i != NULL; i = i->fNextGlyph) {
+        uint8_t* aa = (uint8_t*)i->fImage;
+        if (NULL == aa) {
+            aa = (uint8_t*)state.fCache->findImage(*i);
+            if (NULL == aa) {
+                continue; // can't rasterize glyph
+            }
+        }
+
+        mask.fImage = aa;
+        SkBlitMask::BlitColor(*state.fDraw->fBitmap, mask, *bounds, i->fColor);
+     }
+    
+    if (glyph.fNextGlyph) // color glyph, drawing finish
+        return;
+#endif
+
     uint8_t* aa = (uint8_t*)glyph.fImage;
     if (NULL == aa) {
         aa = (uint8_t*)state.fCache->findImage(glyph);
@@ -1511,8 +1534,6 @@ static void D1G_NoBounder_RectClip(const SkDraw1Glyph& state,
         }
     }
 
-    mask.fRowBytes = glyph.rowBytes();
-    mask.fFormat = static_cast<SkMask::Format>(glyph.fMaskFormat);
     mask.fImage = aa;
     state.blitMask(mask, *bounds);
 }

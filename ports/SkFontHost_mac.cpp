@@ -293,6 +293,7 @@ static CGAffineTransform MatrixToCGAffineTransform(const SkMatrix& matrix,
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#define BITMAP_INFO_ARGB (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host)
 #define BITMAP_INFO_RGB (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host)
 #define BITMAP_INFO_GRAY (kCGImageAlphaNone)
 
@@ -645,6 +646,7 @@ struct GlyphRect {
 class SkScalerContext_Mac : public SkScalerContext {
 public:
     SkScalerContext_Mac(SkTypeface_Mac*, const SkDescriptor*);
+    const bool fColorBitmapFont;
 
 protected:
     unsigned generateGlyphCount(void) SK_OVERRIDE;
@@ -656,6 +658,7 @@ protected:
     void generateFontMetrics(SkPaint::FontMetrics* mX, SkPaint::FontMetrics* mY) SK_OVERRIDE;
 
 private:
+    bool isColorBitmapFont();
     static void CTPathElement(void *info, const CGPathElement *element);
 
     /** Returns the offset from the horizontal origin to the vertical origin in SkGlyph units. */
@@ -694,6 +697,8 @@ private:
 
     Offscreen fOffscreen;
     AutoCFRelease<CTFontRef> fCTFont;
+    AutoCFRelease<CTFontRef> fCTColorBitmapFont;
+    CGAffineTransform        fCTColorBitmapFontMat;
 
     /** Vertical variant of fCTFont.
      *
@@ -717,6 +722,12 @@ private:
     typedef SkScalerContext INHERITED;
 };
 
+bool SkScalerContext_Mac::isColorBitmapFont()
+{
+    CTFontSymbolicTraits traits = CTFontGetSymbolicTraits(static_cast<SkTypeface_Mac*>(getTypeface())->fFontRef.get());
+    return traits & kCTFontColorGlyphsTrait;
+}
+
 SkScalerContext_Mac::SkScalerContext_Mac(SkTypeface_Mac* typeface,
                                          const SkDescriptor* desc)
         : INHERITED(typeface, desc)
@@ -725,8 +736,10 @@ SkScalerContext_Mac::SkScalerContext_Mac(SkTypeface_Mac* typeface,
         , fGeneratedFBoundingBoxes(false)
         , fDoSubPosition(SkToBool(fRec.fFlags & kSubpixelPositioning_Flag))
         , fVertical(SkToBool(fRec.fFlags & kVertical_Flag))
+        , fColorBitmapFont(isColorBitmapFont())
 
 {
+    if (fColorBitmapFont) forceGenerateImageFromPath(false);
     CTFontRef ctFont = typeface->fFontRef.get();
     CFIndex numGlyphs = CTFontGetGlyphCount(ctFont);
     SkASSERT(numGlyphs >= 1 && numGlyphs <= 0xFFFF);
@@ -756,6 +769,12 @@ SkScalerContext_Mac::SkScalerContext_Mac(SkTypeface_Mac* typeface,
         CGAffineTransform rotateLeft = CGAffineTransformMake(0, -1, 1, 0, 0, 0);
         transform = CGAffineTransformConcat(rotateLeft, transform);
         fCTVerticalFont = CTFontCreateCopyWithAttributes(ctFont, 1, &transform, NULL);
+    }
+  
+    // Color Bitmap Font has different matrix calculation
+    if (fColorBitmapFont) {
+        fCTColorBitmapFont = CTFontCreateCopyWithAttributes(ctFont, 1, &CGAffineTransformIdentity, ctFontDesc);
+        fCTColorBitmapFontMat = transform;
     }
 
     SkScalar emPerFUnit = SkScalarInvert(SkIntToScalar(CGFontGetUnitsPerEm(fCGFont)));
@@ -799,7 +818,8 @@ CGRGBPixel* Offscreen::getCG(const SkScalerContext_Mac& context, const SkGlyph& 
         rowBytes = fSize.fWidth * sizeof(CGRGBPixel);
         void* image = fImageStorage.reset(rowBytes * fSize.fHeight);
         fCG = CGBitmapContextCreate(image, fSize.fWidth, fSize.fHeight, 8,
-                                    rowBytes, fRGBSpace, BITMAP_INFO_RGB);
+                                    rowBytes, fRGBSpace, context.fColorBitmapFont ?
+                                    BITMAP_INFO_ARGB : BITMAP_INFO_RGB);
 
         // skia handles quantization itself, so we disable this for cg to get
         // full fractional data from them.
@@ -807,9 +827,6 @@ CGRGBPixel* Offscreen::getCG(const SkScalerContext_Mac& context, const SkGlyph& 
         CGContextSetShouldSubpixelQuantizeFonts(fCG, false);
 
         CGContextSetTextDrawingMode(fCG, kCGTextFill);
-        CGContextSetFont(fCG, context.fCGFont);
-        CGContextSetFontSize(fCG, 1 /*CTFontGetSize(context.fCTFont)*/);
-        CGContextSetTextMatrix(fCG, CTFontGetMatrix(context.fCTFont));
 
         // Because CG always draws from the horizontal baseline,
         // if there is a non-integral translation from the horizontal origin to the vertical origin,
@@ -819,7 +836,8 @@ CGRGBPixel* Offscreen::getCG(const SkScalerContext_Mac& context, const SkGlyph& 
 
         // Draw white on black to create mask.
         // TODO: Draw black on white and invert, CG has a special case codepath.
-        CGContextSetGrayFillColor(fCG, 1.0f, 1.0f);
+        if(!context.fColorBitmapFont)
+            CGContextSetGrayFillColor(fCG, 1.0f, 1.0f);
 
         // force our checks below to happen
         fDoAA = !doAA;
@@ -857,9 +875,19 @@ CGRGBPixel* Offscreen::getCG(const SkScalerContext_Mac& context, const SkGlyph& 
         subY += offset.fY;
     }
 
-    CGContextShowGlyphsAtPoint(fCG, -glyph.fLeft + subX,
-                               glyph.fTop + glyph.fHeight - subY,
-                               &glyphID, 1);
+    if (!context.fColorBitmapFont)
+        CGContextSetTextPosition(fCG, -glyph.fLeft + subX, glyph.fTop + glyph.fHeight - subY);
+    else {
+        CGContextSaveGState(fCG);
+        CGContextTranslateCTM(fCG, -glyph.fLeft + subX, glyph.fTop + glyph.fHeight - subY);
+        CGContextConcatCTM(fCG, context.fCTColorBitmapFontMat);
+    }
+  
+    static const CGPoint pos = {0, 0};
+    CTFontDrawGlyphs(context.fColorBitmapFont ? context.fCTColorBitmapFont : context.fCTFont, &glyphID, &pos, 1, fCG);
+  
+    if (context.fColorBitmapFont)
+        CGContextRestoreGState(fCG);
 
     SkASSERT(rowBytesPtr);
     *rowBytesPtr = rowBytes;
@@ -1013,7 +1041,12 @@ void SkScalerContext_Mac::generateMetrics(SkGlyph* glyph) {
     } else {
         // CTFontGetBoundingRectsForGlyphs produces cgBounds in CG units (pixels, y up).
         CGRect cgBounds;
-        CTFontGetBoundingRectsForGlyphs(fCTFont, kCTFontHorizontalOrientation,
+        if (fColorBitmapFont) {
+            CTFontGetOpticalBoundsForGlyphs(fCTColorBitmapFont, &cgGlyph, &cgBounds, 1, 0);
+            cgBounds = CGRectApplyAffineTransform(cgBounds, fCTColorBitmapFontMat);
+        }
+        else
+            CTFontGetBoundingRectsForGlyphs(fCTFont, kCTFontHorizontalOrientation,
                                         &cgGlyph, &cgBounds, 1);
 
         // BUG?
@@ -1058,15 +1091,18 @@ void SkScalerContext_Mac::generateMetrics(SkGlyph* glyph) {
     // Note that this outset is to allow room for LCD smoothed glyphs. However, the correct outset
     // is not currently known, as CG dilates the outlines by some percentage.
     // Note that if this context is A8 and not back-forming from LCD, there is no need to outset.
-    skIBounds.outset(1, 1);
+  
+    if(fColorBitmapFont) {
+        glyph->fMaskFormat = SkMask::kARGB32_Format;
+        skIBounds.outset(fRec.fPost2x2[0][0], fRec.fPost2x2[1][1]);
+    }
+    else
+        skIBounds.outset(1, 1);
+  
     glyph->fLeft = SkToS16(skIBounds.fLeft);
     glyph->fTop = SkToS16(skIBounds.fTop);
     glyph->fWidth = SkToU16(skIBounds.width());
     glyph->fHeight = SkToU16(skIBounds.height());
-
-#ifdef HACK_COLORGLYPHS
-    glyph->fMaskFormat = SkMask::kARGB32_Format;
-#endif
 }
 
 #include "SkColorPriv.h"
@@ -1279,20 +1315,19 @@ void SkScalerContext_Mac::generateImage(const SkGlyph& glyph) {
                 dst += dstRB;
             }
         } break;
-#ifdef HACK_COLORGLYPHS
         case SkMask::kARGB32_Format: {
             const int width = glyph.fWidth;
             size_t dstRB = glyph.rowBytes();
             SkPMColor* dst = (SkPMColor*)glyph.fImage;
             for (int y = 0; y < glyph.fHeight; y++) {
                 for (int x = 0; x < width; ++x) {
-                    dst[x] = cgpixels_to_pmcolor(cgPixels[x], glyph, x, y);
+                    //dst[x] = cgpixels_to_pmcolor(cgPixels[x], glyph, x, y);
+                    dst[x] = cgPixels[x];
                 }
                 cgPixels = (CGRGBPixel*)((char*)cgPixels + cgRowBytes);
                 dst = (SkPMColor*)((char*)dst + dstRB);
             }
         } break;
-#endif
         default:
             SkDEBUGFAIL("unexpected mask format");
             break;
